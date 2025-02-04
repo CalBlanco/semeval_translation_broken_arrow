@@ -7,3 +7,4 @@ notebooks/
 trained_models/pretrain_decoder_model
 trained_models/pretrain_encoder_model
 models/
+outputs/

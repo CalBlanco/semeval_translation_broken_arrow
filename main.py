@@ -4,7 +4,7 @@ from config import HF_MBART_CONFIG
 import pandas as pd
 import os
 
-model = FineTunedMBart()
+model = FineTunedMBart('./mbart-longer-train')
 
 langs = ['ar', 'de', 'es', 'fr', 'ja', 'it', 'ko', 'th', 'tr', 'zh']
 
@@ -27,7 +27,7 @@ for lang in langs:
     
     ent_data['parsed'] = ent_data['target'].apply(lambda x: ','.join(str(x).split("*|*"))) #run our function to merge entites
 
-    test_data['mod'] = test_data['source'] + ent_data['parsed'] #create column in dataframe for our modified input
+    test_data['mod'] = test_data['source'] + "|" + ent_data['parsed'] #create column in dataframe for our modified input
 
 
     wrapper = lambda x: model.batch_translate(x, lang, HF_MBART_CONFIG['batch_size']) #wrapper for model translation
@@ -35,5 +35,6 @@ for lang in langs:
 
     formated = format_frame_for_sub(lang, out_frame)
 
-    formated.to_json(f'./outputs/ex1_{lang}.json', orient='records', lines=True)
+    formated.to_json(f'./outputs/longer_{lang}.json', orient='records', lines=True)
+
 

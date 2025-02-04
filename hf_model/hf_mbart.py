@@ -13,6 +13,12 @@ from config import semeval_langs, HF_MBART_CONFIG
 
 
 class FineTunedMBart():
+    """ Fine tuned MBart wrapper
+
+    ARGS:
+        - path<str> : the path to the model relative to the caller
+        - flair_model<str> : name of flair model to use NOTE This argument does nothing at the moment because Flair predictions are disabled in favor of pre-processed predictions
+    """
     def __init__(self, path:str='./mbart-finetuned-01', flair_model='ner-large'):
 
         self.model_path = path
