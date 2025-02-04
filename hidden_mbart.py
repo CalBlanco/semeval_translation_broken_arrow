@@ -1,26 +1,27 @@
 '''
-Attention: This experiment is where the encoder creates the embeddings and 
-the decoder uses them in self attention and cross attention
+Appends encoded entity to the encoded source text and then passes it to the MBart model.
 '''
+
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '4'
 
 import torch
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 import setproctitle
-setproctitle.setproctitle('mbart_crossattn')
+setproctitle.setproctitle('hiddenstate_finetuning')
 
 from transformers import MBartForConditionalGeneration, MBart50TokenizerFast
 from transformers import  Seq2SeqTrainingArguments, Seq2SeqTrainer, DataCollatorForSeq2Seq
-from transformers.modeling_outputs import Seq2SeqLMOutput
 import evaluate
 from datasets import load_dataset
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
 import torch
+from transformers.modeling_outputs import Seq2SeqLMOutput
 import json
+
 
 data_files = {
     'train': 'smashing/smashed_train.csv',
@@ -32,7 +33,7 @@ tokenizer = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50-one-to
 
 metric = evaluate.load("accuracy")
 
-#dictionary to convert mbart language codes to the ones used in the dataset
+# Convert language codes
 lang_convert = {
         'ar_AE': 'ar_AR',
         'zh_TW': 'zh_CN',
@@ -47,9 +48,9 @@ lang_convert = {
     }
 
 training_args = Seq2SeqTrainingArguments(
-    output_dir="./crossattn",
-    evaluation_strategy="epoch",
-    save_strategy="epoch",
+    output_dir="./hiddenstate",
+    evaluation_strategy="epoch",  # Evaluate at the end of each epoch
+    save_strategy="best",
     per_device_train_batch_size=8,
     per_device_eval_batch_size=8,
     learning_rate=5e-5,
@@ -57,13 +58,11 @@ training_args = Seq2SeqTrainingArguments(
     save_total_limit=3,
     num_train_epochs=10,
     predict_with_generate=True,
-    fp16=True,
-    logging_dir="./logs",
-    logging_steps=100,
+    fp16=True,  # Use FP16 if training on a GPU
+    logging_dir="./logs",  # Logging directory
+    logging_steps=100,  # Log every 100 steps
     push_to_hub=False,
-    metric_for_best_model="eval_loss",
-    load_best_model_at_end=True,
-    greater_is_better=False,
+    metric_for_best_model="eval_loss"
 )
 
 def compute_metrics(eval_pred):
@@ -96,32 +95,29 @@ def compute_metrics(eval_pred):
     return results
 
 def preprocess_function(examples):
-    '''
-    Preprocesses the dataset for training, tokenizes the source and entity texts, pads
-    '''
-
+    # Split source and entity
     source_texts = []
     entity_texts = []
     
     for text in examples["source_entity"]:
         parts = text.split("|")
         if len(parts) == 2:
-            source_texts.append(parts[0] + "<" + parts[1] + ">")  # adds translated entity after source text
+            source_texts.append(parts[0] + "<" + parts[1] + ">")
             entity_texts.append(parts[1])
         else:
             source_texts.append(text)
             entity_texts.append("")
     
     # Set source language token for encoder
-    tokenizer.src_lang = "en_XX"  # All source texts are in English
+    tokenizer.src_lang = "en_XX"  # All our source texts are in English
     
-    # Tokenize main text and entities separately
+    # Tokenize the main text and entities separately so we can get the entity embeddings
     source_inputs = tokenizer(
         source_texts, 
         padding="max_length", 
         truncation=True, 
         max_length=128,
-        return_tensors="pt"     # return tensors as pytorch tensors
+        return_tensors="pt"
     )
     
     entity_inputs = tokenizer(
@@ -146,25 +142,26 @@ def preprocess_function(examples):
         )
         targets_list.append(target_tokens["input_ids"])
     
-    # Stack all target tensors
+    # Stack ze target tensors
     targets = torch.cat(targets_list, dim=0)
 
-    # Keep source and entity inputs separate
+    # Keep source and entity inputs separate for this experiment
     inputs = {
         "input_ids": source_inputs["input_ids"].to(device),
         "attention_mask": source_inputs["attention_mask"].to(device),
         "entity_input_ids": entity_inputs["input_ids"].to(device),
         "entity_attention_mask": entity_inputs["attention_mask"].to(device),
         "labels": targets.to(device),
-        "forced_bos_token_id": [tokenizer.lang_code_to_id[lang_convert[lang]] for lang in examples["lang"]] # forces the bos token to be the language token
+        "forced_bos_token_id": [tokenizer.lang_code_to_id[lang_convert[lang]] for lang in examples["lang"]]
     }
     
     return inputs
 
-
-class MBartWithCrossAttnModel(MBartForConditionalGeneration):
+# custom MBart model
+class MBartWithEntityModel(MBartForConditionalGeneration):
     '''
-    Custom mbart implementation that adds translated entity information to cross attention
+    Custom mbart implementation that appends encoded entity information 
+    to the hidden states of the encoder output
     '''
     def forward(
         self,
@@ -211,12 +208,24 @@ class MBartWithCrossAttnModel(MBartForConditionalGeneration):
                     return_dict=True,
                 )
                 
-                # Store the entity encodings so we can add em to cross attention
-                self.entity_hidden_states = entity_outputs.last_hidden_state
-                self.entity_attention_mask = entity_attention_mask
+                # Append entity hidden states to encoder outputs
+                # Take mean of entity hidden states across sequence length
+                entity_hidden = torch.mean(entity_outputs.last_hidden_state, dim=1, keepdim=True)
+                
+                # Expand entity hidden states to match batch size
+                # !!!! MAY DAY MAY DAY DOES THIS MAKE SENSE CHAT? 
+                entity_hidden = entity_hidden.expand(-1, encoder_outputs.last_hidden_state.size(1), -1)
+                
+                # Concatenate entity hidden states to encoder outputs
+                encoder_outputs.last_hidden_state = torch.cat(
+                    [encoder_outputs.last_hidden_state, entity_hidden], dim=-1
+                )
+                
+                # Update attention mask to account for appended states
+                attention_mask = attention_mask.clone()
 
-        # Get decoder outputs
-        decoder_outputs = self.model.decoder(
+        # Get decoder outputs with modified encoder hidden states
+        outputs = self.model.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
             encoder_hidden_states=encoder_outputs.last_hidden_state,
@@ -226,76 +235,41 @@ class MBartWithCrossAttnModel(MBartForConditionalGeneration):
             past_key_values=past_key_values,
             inputs_embeds=decoder_inputs_embeds,
             use_cache=use_cache,
-            output_attentions=True,  # We need the attention outputs
-            output_hidden_states=True,  # We need the hidden states
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
             return_dict=True,
         )
 
-        # Process entity information through cross-attention
-        if hasattr(self, 'entity_hidden_states'):
-            # create cross attention for entity information
-            for layer in self.model.decoder.layers:
-                entity_cross_outputs = layer.encoder_attn(
-                    hidden_states=decoder_outputs.last_hidden_state,
-                    key_value_states=self.entity_hidden_states,
-                    attention_mask=self.entity_attention_mask,
-                    output_attentions=True
-                )
-                
-                # Add entity context through residual connection
-                decoder_outputs.last_hidden_state = decoder_outputs.last_hidden_state + entity_cross_outputs[0]
-                
-                # Apply layer norm
-                decoder_outputs.last_hidden_state = layer.encoder_attn_layer_norm(decoder_outputs.last_hidden_state)
+        sequence_output = outputs.last_hidden_state
 
         # Project to vocabulary
-        lm_logits = self.lm_head(decoder_outputs.last_hidden_state)
+        lm_logits = self.lm_head(sequence_output)
 
-        # Always calculate loss during training
-        loss = torch.tensor(0.0, device=lm_logits.device)  # Initialize with zeros
-
+        loss = None
         if labels is not None:
-            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)  # Ignores padding tokens
-            loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.view(-1))    # cross entropy loss 
+            loss_fct = torch.nn.CrossEntropyLoss()
+            loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.view(-1))
 
         return Seq2SeqLMOutput(
             loss=loss,
             logits=lm_logits,
-            past_key_values=decoder_outputs.past_key_values,
-            decoder_hidden_states=decoder_outputs.hidden_states,
-            decoder_attentions=decoder_outputs.attentions,
-            cross_attentions=decoder_outputs.cross_attentions,
+            past_key_values=outputs.past_key_values,
+            decoder_hidden_states=outputs.hidden_states,
+            decoder_attentions=outputs.attentions,
+            cross_attentions=outputs.cross_attentions,
             encoder_last_hidden_state=encoder_outputs.last_hidden_state,
             encoder_hidden_states=encoder_outputs.hidden_states,
             encoder_attentions=encoder_outputs.attentions,
         )
-    
-def load_model(model_path=None):
-    '''
-    Load the default or fine-tuned model
-    '''
 
-    if model_path is None:
-        print('No model path provided, loading default model.')
-        model = MBartForConditionalGeneration.from_pretrained("facebook/mbart-large-50-one-to-many-mmt").to(device)
-    else:
-        print(f'Loading fine-tuned model from {model_path}!')
-        model = MBartWithCrossAttnModel.from_pretrained(model_path).to(device)
-
-    return model.to(device)
-
-
-def generate_and_save_translations(text, target_langs, model_path=None, output_dir="append_hidden_states"):
+def generate_and_save_translations(text, target_langs, output_dir="append_hidden_states"):
     """
     Generate translations and save them to separate files by language
     """
-    # Load the model
-    model = load_model(model_path).to(device)
-
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
     
-    source_parts = text.split("|")      # separating entities and sequences for this experiment
+    source_parts = text.split("|")
     source_text = source_parts[0]
     entity = source_parts[1] if len(source_parts) > 1 else ""
     
@@ -330,36 +304,38 @@ def generate_and_save_translations(text, target_langs, model_path=None, output_d
             "translation": translated_text
         }
         
-        # write to language-specific file
-        with open(output_file, 'w', encoding='utf-8') as f:
+        # Append to language-specific file
+        with open(output_file, 'a', encoding='utf-8') as f:
             f.write(json.dumps(output, ensure_ascii=False) + '\n')
         
         print(f"Saved translation for {target_lang}: {translated_text}")
-        
-if __name__ == '__main__':
 
-    # # tokenize dataset
-    # tokenized_datasets = dataset.map(preprocess_function, batched=True)
 
-    # # initialize pretrained model
-    # model = MBartForConditionalGeneration.from_pretrained("facebook/mbart-large-50-one-to-many-mmt").to(device)
+if __name__ == '__main__':  
 
-    # # initialize trainer
-    # trainer = Seq2SeqTrainer(
-    #     model=model,
-    #     args=training_args,
-    #     train_dataset=tokenized_datasets["train"],
-    #     eval_dataset=tokenized_datasets["validation"],
-    #     tokenizer=tokenizer,
-    #     data_collator=DataCollatorForSeq2Seq(tokenizer, model=model)
-    # )
+    tokenized_datasets = dataset.map(preprocess_function, batched=True)
 
-    # trainer.train()
-    # trainer.save_model("./crossattn/model")  # saves the model and can be reloaded using from_pretrained()
-    # tokenizer.save_pretrained("./crossattn/config")  # saves as a config file for tokenizer
-    
+    # initialize pretrained model
+    model = MBartForConditionalGeneration.from_pretrained("facebook/mbart-large-50-one-to-many-mmt").to(device)
+
+    # initialize trainer
+    trainer = Seq2SeqTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_datasets["train"],
+        eval_dataset=tokenized_datasets["validation"],
+        tokenizer=tokenizer,
+        data_collator=DataCollatorForSeq2Seq(tokenizer, model=model)
+    )
+
+    trainer.train()
+    trainer.save_model("./hiddenstate/model")
+    tokenizer.save_pretrained("./hiddenstate/config")
+
     # Test text
-    text = 'How does the White Queen interact with Alice in Through the Looking-Glass?'
+    text = "Has Bernie Sanders ever been president of the United States?|بيرني ساندرز"
+
     # Generate and save translations for all supported languages
-    target_langs = ["ja_JP"]
-    generate_and_save_translations(text, target_langs, model_path="./crossattn/model")
+    target_langs = ["ar_AE", "es_ES", "fr_FR", "de_DE", "it_IT", "ja_JP", "ko_KR", "tr_TR", "th_TH"]
+    generate_and_save_translations(text, target_langs)
+
