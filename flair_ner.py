@@ -44,7 +44,7 @@ def get_torch_device():
     return device
 
 # load the NER tagger
-tagger = Classifier.load('ner-large').to(device=get_torch_device())
+tagger = Classifier.load('ner-large').to(device='cuda')
 
 
 def gather_true_entities(language: str, output_file: str):

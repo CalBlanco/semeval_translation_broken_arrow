@@ -6,8 +6,11 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
 import torch
+from accelerate import Accelerator
 
+accelerator = Accelerator()
 
+OUTPUT_DIR = './mbart-longer-train'
 
 data_files = {
     'train': './data/smashed_train.csv',
@@ -33,15 +36,15 @@ data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
 from transformers import Seq2SeqTrainingArguments
 
 training_args = Seq2SeqTrainingArguments(
-    output_dir="./mbart-finetuned",
+    output_dir=OUTPUT_DIR,
     evaluation_strategy="epoch",  # Evaluate at the end of each epoch
     save_strategy="epoch",
-    per_device_train_batch_size=8,
-    per_device_eval_batch_size=8,
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=16,
     learning_rate=5e-5,
     weight_decay=0.01,
     save_total_limit=3,
-    num_train_epochs=3,
+    num_train_epochs=10,
     predict_with_generate=True,
     fp16=True,  # Use FP16 if training on a GPU
     logging_dir="./logs",  # Logging directory
@@ -88,21 +91,5 @@ trainer = Seq2SeqTrainer(
 )
 
 trainer.train()
-trainer.save_model("./mbart-finetuned-01")
-tokenizer.save_pretrained("./mbart-finetuned-01")
-
-text = "What kind of artwork is The Signal-Man?|El guardavía"
-target_lang = "es_ES"  # Choose any language from your dataset
-
-tokenized_input = tokenizer(text, return_tensors="pt")
-
-generated_tokens = model.generate(
-    **tokenized_input,
-    forced_bos_token_id=tokenizer.lang_code_to_id[target_lang]
-)
-
-translated_text = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
-print(translated_text)
-
-
-print('test')
+trainer.save_model(OUTPUT_DIR)
+tokenizer.save_pretrained(OUTPUT_DIR)
